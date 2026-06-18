@@ -96,7 +96,6 @@ class Word(NamedTuple):
     size: float        # font size in points
     font: str          # font name exactly as stored in the PDF
     is_math: bool      # True when heuristics flag this as a math/symbol token
-    block_num: int     # the block number in the page's rawdict structure
 
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
@@ -253,18 +252,11 @@ def extract_words(page: fitz.Page, skip_math: bool) -> list[Word]:
         # block["type"] == 0 is text; 1 is an embedded image — skip images
         if block["type"] != 0:
             continue
-        # print('------------------------------------')
-        # print(block)
-        # print('------------------------------------')
-        block_num = block["number"]
         for line in block["lines"]:
-            if line["dir"] != (1.0, 0.0):   # skip rotated or vertical text
-                continue
-                # print('------------------------------------')
-                # print(line)
-                # print('------------------------------------')
-                # print(line["dir"])
-                # print('------------------------------------')
+            if line["dir"][1] != 0:
+                print(line)
+                print(line["dir"])
+                print('------------------------------------')
             for span in line["spans"]:
                 font_name = span["font"]
                 size      = span["size"]
@@ -282,19 +274,19 @@ def extract_words(page: fitz.Page, skip_math: bool) -> list[Word]:
                         # Whitespace signals the end of the current word
                         if current_chars:
                             _flush_word(current_chars, font_name, size,
-                                        math_flag, words, block_num)
+                                        math_flag, words)
                             current_chars = []
                     else:
                         current_chars.append(ch)
                 # Flush any trailing word that wasn't followed by whitespace
                 if current_chars:
-                    _flush_word(current_chars, font_name, size, math_flag, words, block_num)
+                    _flush_word(current_chars, font_name, size, math_flag, words)
 
     return words
 
 
 def _flush_word(chars: list[dict], font: str, size: float,
-                math_flag: bool, out: list[Word], block_num: int) -> None:
+                math_flag: bool, out: list[Word]) -> None:
     """
     Finalise a collected group of characters into a Word and append it to `out`.
 
@@ -320,18 +312,17 @@ def _flush_word(chars: list[dict], font: str, size: float,
     # The typographic origin is the baseline of the first character
     origin = (chars[0]["origin"][0], chars[0]["origin"][1])
     out.append(Word(text=text, origin=origin, bbox=bbox,
-                    size=size, font=font, is_math=math_flag, block_num=block_num))
+                    size=size, font=font, is_math=math_flag))
 
 
 # ── Sentence splitting ─────────────────────────────────────────────────────────
 
 def split_sentences(words: list[Word]) -> list[list[Word]]:
     """
-    Group a flat list of Words into sentences based on terminal punctuation and
-    block boundaries.
+    Group a flat list of Words into sentences based on terminal punctuation.
 
     Strategy:
-    - A word ending in `:`, `;`, `.`, `!`, or `?` (optionally followed by a closing quote
+    - A word ending in `.`, `!`, or `?` (optionally followed by a closing quote
       or bracket) terminates the current sentence.
     - Words whose stripped, de-punctuated core appears in ABBREVS (e.g. "fig",
       "et") are NOT treated as sentence boundaries.
@@ -349,51 +340,11 @@ def split_sentences(words: list[Word]) -> list[list[Word]]:
     """
     sentences: list[list[Word]] = []
     current: list[Word] = []
-    blk_num = words[0].block_num
-    inside_parenthesis = False
-
     for w in words:
-
-        if w.block_num != blk_num:
-            # If the block number changes, we treat it as a hard sentence boundary
-            sentences.append(current)
-            current = []
-            blk_num = w.block_num
-
-        t = w.text
-
-        # Check if the characters exist anywhere in the word string
-        has_open = '(' in t
-        has_close = ')' in t
-
-        # Case 1: Word contains BOTH '(' and ')' -> Skip just this single word
-        if has_open and has_close:
-            continue
-
-        # Case 2: Word starts a parenthetical block
-        if has_open:
-            inside_parenthesis = True
-            continue  # Skip this word
-            
-        # Case 3: Word contains a closing parenthesis
-        if inside_parenthesis and has_close:
-            inside_parenthesis = False
-            if re.search(r'[.!?;:]["\')\]]?$', t):
-                # Strip the terminal punctuation to get the core word for abbrev check
-                core = t.rstrip('.!?"\'()[]').lower()
-                # Only split if it's NOT an abbreviation and NOT a single lowercase letter
-                if core not in ABBREVS and not re.fullmatch(r'[a-z]', core):
-                    sentences.append(current)
-                    current = []
-            continue  # Skip the final word of the block
-            
-        # Case 4: Currently inside a block, skip everything in between
-        if inside_parenthesis:
-            continue
-
         current.append(w)
+        t = w.text
         # Match terminal punctuation, optionally followed by closing delimiters
-        if re.search(r'[.!?;:]["\')\]]?$', t):
+        if re.search(r'[.!?]["\')\]]?$', t):
             # Strip the terminal punctuation to get the core word for abbrev check
             core = t.rstrip('.!?"\'()[]').lower()
             # Only split if it's NOT an abbreviation and NOT a single lowercase letter
@@ -415,15 +366,24 @@ def process_page(page: fitz.Page, bold_ratio: float, colors: list,
 
     The transformation is a five-phase overlay pipeline:
 
-    Phase 1 — Extract:
+    Phase 1 — Rasterise:
+        Render the original page to a pixmap. This preserves all figures,
+        equations, and graphical elements that we cannot reconstruct as vectors.
+
+    Phase 2 — Extract:
         Pull word positions from the original page content *before* modifying it.
         We need the original text positions to know where to write the new text.
 
-    Phase 2 — White knockouts:
-        Draw white rectangles over each word's bounding box.
-        the new crisp vector text written in phase 3 is clearly readable.
+    Phase 3 — Blank + background:
+        Erase all page content streams and reinsert the rasterised pixmap as a
+        full-page background image. The page is now a flat image.
 
-    Phase 3 — Bionic text:
+    Phase 4 — White knockouts:
+        Draw semi-transparent white rectangles over each word's bounding box.
+        This erases the blurry rasterised text pixels so the new crisp vector
+        text written in phase 5 is clearly readable.
+
+    Phase 5 — Bionic text:
         Use fitz.TextWriter to place each word's bold prefix and normal suffix
         at the exact PDF-space coordinates extracted in phase 2, coloured by
         sentence index.
@@ -439,22 +399,36 @@ def process_page(page: fitz.Page, bold_ratio: float, colors: list,
                       leaving their rasterised appearance from the background.
     """
 
-    # ── Phase 1: Extract text positions from the untouched page ───────────────
+    # ── Phase 1: Rasterise the original page ─────────────────────────────────
+    # Scale 1.5× gives ~108 DPI, balancing quality against file size.
+    # alpha=False produces an RGB pixmap (no transparency needed for background).
+    # mat = fitz.Matrix(2.0, 2.0)
+    # pix = page.get_pixmap(matrix=mat, alpha=False)
+
+    # ── Phase 2: Extract text positions from the untouched page ───────────────
     # Must happen BEFORE clean_contents() destroys the original content streams.
     words = extract_words(page, skip_math)
     sentences = split_sentences(words)
 
-    # ── Phase 2: Blank the page and add White knockout rectangles behind each text word ────────────
+    # ── Phase 3: Blank the page and reinsert rasterised background ────────────
     # clean_contents() removes all existing PDF operators (text, paths, images).
-    page.clean_contents()
+    # insert_image() places the pixmap to fill the entire page rectangle,
+    # effectively converting the page to a flat image base layer.
+    # page.clean_contents()
     rect = page.rect
+    # page.insert_image(rect, pixmap=pix, keep_proportion=False)
 
+    # ── Phase 4: White knockout rectangles behind each text word ──────────────
+    # Without this, the bionic vector text would sit on top of blurry rasterised
+    # text from the background image, making it hard to read.
+    # fill_opacity=0.88 retains a slight hint of the background (useful when
+    # coloured or shaded text boxes exist in the original).
     shape = page.new_shape()
     for sent in sentences:
         for w in sent:
             if w.is_math:
                 continue   # leave math regions as rasterised — do not blank them
-            # Expand the word bbox by x pt on each side to avoid clipping
+            # Expand the word bbox by 1.2 pt on each side to avoid clipping
             # descenders (e.g. 'g', 'p', 'y') and tall ascenders ('h', 'l')
             pad = 0
             r = fitz.Rect(w.bbox.x0 - pad, w.bbox.y0 - pad,
@@ -464,11 +438,11 @@ def process_page(page: fitz.Page, bold_ratio: float, colors: list,
                          color=None, width=0)
     shape.commit()   # flush all drawn paths to the page in a single operation
 
-    # ── Phase 3: Write bionic-formatted text ──────────────────────────────────
+    # ── Phase 5: Write bionic-formatted text ──────────────────────────────────
     # TextWriter batches all glyph operations and flushes them in one call to
     # write_text(), which is more efficient than inserting each word separately.
     # writer = fitz.TextWriter(rect)
-    # Setup a dedicated TextWriter instance for EVERY color in your list
+    # 1. Setup a dedicated TextWriter instance for EVERY color in your list
     writers = {col: fitz.TextWriter(rect) for col in colors}
 
 
